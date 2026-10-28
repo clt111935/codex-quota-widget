@@ -38,6 +38,7 @@ class WindowFollower:
         self._hidden = False
         self._mode: bool | None = None
         self._offset = self.DEFAULT_OFFSET
+        self._pending_position: tuple[int, int] | None = None
         self._last_rect: tuple[int, int, int, int] | None = None
         if self._supported:
             self._bind_win32()
@@ -179,22 +180,28 @@ class WindowFollower:
 
     def set_offset(self, dx: int, dy: int) -> None:
         self._offset = (int(dx), int(dy))
+        self._pending_position = None
+
+    @property
+    def offset(self) -> tuple[int, int] | None:
+        """Return the relative position, or None while waiting for the owner."""
+        return self._offset if self._pending_position is None else None
 
     def reset_offset(self) -> None:
-        self._offset = self.DEFAULT_OFFSET
+        self.set_offset(*self.DEFAULT_OFFSET)
 
     def remember_position(self) -> None:
         """Remember the current root position after a user drag in follow mode."""
-        if self._last_rect is not None:
-            left, top, right, bottom = self._last_rect
-            width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
-            self._offset = (self.root.winfo_x() - (right - width), self.root.winfo_y() - top)
+        self.set_offset_from_position(self.root.winfo_x(), self.root.winfo_y())
 
     def set_offset_from_position(self, x: int, y: int) -> None:
         """Preserve a drag position without waiting for Tk's geometry update."""
         if self._last_rect is not None:
             width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
-            self._offset = (int(x) - (self._last_rect[2] - width), int(y) - self._last_rect[1])
+            self.set_offset(int(x) - (self._last_rect[2] - width), int(y) - self._last_rect[1])
+        else:
+            # A drag before Codex opens must also survive the first follow tick.
+            self._pending_position = (int(x), int(y))
 
     def update(self, enabled: bool) -> str:
         if not self._supported:
@@ -228,6 +235,8 @@ class WindowFollower:
                 return "等待 Codex 桌面客户端"
             self._last_rect = (rect.left, rect.top, rect.right, rect.bottom)
             self.root.update_idletasks()
+            if self._pending_position is not None:
+                self.set_offset_from_position(*self._pending_position)
             width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
             height = max(self.root.winfo_height(), self.root.winfo_reqheight())
             x = rect.right - width + self._offset[0]

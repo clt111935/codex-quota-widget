@@ -26,6 +26,8 @@ class Settings:
     refresh_seconds: int = 60
     compact: bool = False
     codex_command: str = ""
+    follow_offset_x: int | None = None
+    follow_offset_y: int | None = None
 
 
 def _number(value: Any, default: float, low: float, high: float) -> float:
@@ -94,6 +96,8 @@ def _validated(raw: Any) -> Settings:
         refresh_seconds=int(_number(raw.get("refresh_seconds"), defaults.refresh_seconds, 10, 3600)),
         compact=_boolean(raw.get("compact"), defaults.compact),
         codex_command=command,
+        follow_offset_x=_coordinate(raw.get("follow_offset_x")),
+        follow_offset_y=_coordinate(raw.get("follow_offset_y")),
     )
 
 

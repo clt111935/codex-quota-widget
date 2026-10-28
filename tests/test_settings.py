@@ -35,6 +35,7 @@ class SettingsTests(unittest.TestCase):
             background_dim=0.3, follow_codex=False, x=-1920, y=80,
             refresh_seconds=120, compact=True,
             codex_command="C:/Program Files/OpenAI/Codex/codex.exe",
+            follow_offset_x=-650, follow_offset_y=220,
         )
         save_settings(self.path, expected)
         self.assertEqual(load_settings(self.path), expected)

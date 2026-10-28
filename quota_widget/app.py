@@ -88,6 +88,7 @@ class QuotaApp:
         self._background_warning = ""
         self._closed = False
         self._drag_start = None
+        self._drag_position = None
         self._last_click = None
         self.follow_status = "独立悬浮"
         root.title("Codex 用量伴侣")
@@ -103,6 +104,10 @@ class QuotaApp:
         root.attributes("-alpha", self.settings.opacity)
         root.update_idletasks()
         self.follower = WindowFollower(root)
+        if self.settings.follow_offset_x is not None and self.settings.follow_offset_y is not None:
+            self.follower.set_offset(self.settings.follow_offset_x, self.settings.follow_offset_y)
+        elif self.settings.follow_codex and self.settings.x is not None and self.settings.y is not None:
+            self.follower.set_offset_from_position(x, y)
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
@@ -327,19 +332,47 @@ class QuotaApp:
 
     def _follow_tick(self):
         if not self._closed:
-            try:
-                self.follow_status = self.follower.update(self.settings.follow_codex)
-            except (OSError, tk.TclError):
-                self.follow_status = "暂时无法跟随窗口"
+            if self._drag_start is None:
+                try:
+                    self.follow_status = self.follower.update(self.settings.follow_codex)
+                    self._remember_follow_offset(persist=True)
+                except (OSError, tk.TclError):
+                    self.follow_status = "暂时无法跟随窗口"
             self.root.after(800, self._follow_tick)
 
     def toggle_follow(self):
-        self.settings.follow_codex = not self.settings.follow_codex
+        self.set_follow(not self.settings.follow_codex)
+
+    def set_follow(self, enabled):
+        if enabled == self.settings.follow_codex:
+            return
+        if enabled:
+            # Adopt the current position instead of jumping to the top-right.
+            self.follower.set_offset_from_position(self.root.winfo_x(), self.root.winfo_y())
+        else:
+            self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
+            self.follower.detach()
+        self.settings.follow_codex = enabled
+        self.follow_status = self.follower.update(enabled)
+        self._remember_follow_offset()
         self._persist()
         self.draw()
 
+    def _remember_follow_offset(self, *, persist=False):
+        if not self.settings.follow_codex:
+            return
+        offset = self.follower.offset
+        saved = (self.settings.follow_offset_x, self.settings.follow_offset_y)
+        current = offset if offset is not None else (None, None)
+        if current != saved:
+            self.settings.follow_offset_x, self.settings.follow_offset_y = current
+            if persist:
+                self._persist()
+
     def _press(self, event):
         self._last_click = (event.x_root, event.y_root)
+        self._drag_start = None
+        self._drag_position = None
         if event.y < 77 and not any(x1 <= event.x <= x2 and y1 <= event.y <= y2 for (x1,y1,x2,y2),_ in self.actions):
             self._drag_start = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
 
@@ -348,18 +381,20 @@ class QuotaApp:
             sx,sy,wx,wy = self._drag_start
             if abs(event.x_root-sx) + abs(event.y_root-sy) < 4:
                 return
-            if self.settings.follow_codex:
-                self.settings.follow_codex = False
-                self.follower.detach()
             x, y = self._clamp_position(wx+event.x_root-sx, wy+event.y_root-sy)
+            self._drag_position = (x, y)
+            if self.settings.follow_codex:
+                self.follower.set_offset_from_position(x, y)
             self.root.geometry(f"+{x}+{y}")
 
     def _release(self, event):
-        dragged = self._drag_start and self._last_click and abs(event.x_root-self._last_click[0])+abs(event.y_root-self._last_click[1]) > 4
+        dragged = self._drag_position is not None
         if dragged:
-            self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
+            self.settings.x, self.settings.y = self._drag_position
+            self._remember_follow_offset()
             self._persist()
         self._drag_start = None
+        self._drag_position = None
         if not dragged:
             for (x1,y1,x2,y2), action in self.actions:
                 if x1 <= event.x <= x2 and y1 <= event.y <= y2:
@@ -467,10 +502,13 @@ class QuotaApp:
         picker.pack(side="left", padx=(16,8))
         ttk.Label(interval_row, text="秒", style="Quota.TLabel").pack(side="left")
         picker.bind("<<ComboboxSelected>>", lambda _: change("refresh_seconds",int(interval_var.get())))
-        ttk.Label(frame, text="拖动面板顶部可自由摆放，并切换为独立悬浮。\n右键面板可刷新、切换精简模式或退出。", style="Hint.Quota.TLabel").pack(anchor="w", pady=(2,10))
+        ttk.Label(frame, text="拖动顶部调整位置，跟随状态保持不变。\n点击模式开关可切换为独立悬浮。", style="Hint.Quota.TLabel").pack(anchor="w", pady=(2,10))
         ttk.Button(frame, text="完成", style="Quota.TButton", command=lambda: close_settings()).pack(anchor="e")
 
         def change(key, value, persist=True):
+            if key == "follow_codex":
+                self.set_follow(bool(value))
+                return
             setattr(self.settings, key, value)
             if key == "opacity":
                 self.root.attributes("-alpha", value)
