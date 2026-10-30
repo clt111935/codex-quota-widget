@@ -17,6 +17,13 @@ except ImportError:
     Image = None
 
 from .settings import Settings, load_settings, save_settings
+from .hover import HoverController
+from .quota_colors import QuotaColorAnimator, quota_color
+from .rounded_window import RoundedWindow
+from .sidebar import SidebarThumbnail
+from .startup import StartupRegistration
+from .tray import NotificationIcon
+from .watcher import ClientWindowMonitor
 from .usage import QuotaSnapshot, QuotaWindow, UsageError, UsageService
 from .windows import WindowFollower, desktop_bounds
 
@@ -66,15 +73,33 @@ class QuotaApp:
     WIDTH = 420
     HEIGHT = 504
     COMPACT_HEIGHT = 246
+    CORNER_RADIUS = 20
 
     def __init__(self, root: tk.Tk, config_path: Path, *, demo: bool = False,
-                 service: UsageService | None = None):
+                 service: UsageService | None = None,
+                 startup: StartupRegistration | None = None, control=None,
+                 managed: bool = False, runtime_log=None):
         self.root = root
         self.config_path = config_path
         self.settings = load_settings(config_path)
         self.demo = demo
+        self.startup = startup if not demo else None
+        self.control = control
+        self.managed = managed
+        self.runtime_log = runtime_log
+        self._restart_task = False
+        self._exit_code = 0
+        self._user_hidden = False
+        self._temporary_independent = False
+        self._restore_hold_until = 0.0
+        self.window_monitor = None
+        self.tray = None
+        self.launch_linked = bool(self.startup and self.startup.is_enabled())
+        self._client_present = False
         if demo:
             self.settings = replace(self.settings, follow_codex=False)
+        elif self.settings.sidebar_dock:
+            self.settings.follow_codex = True
         self.service = service or UsageService(codex_command=self.settings.codex_command or None)
         self.snapshot: QuotaSnapshot | None = demo_snapshot() if demo else None
         self.error = ""
@@ -87,12 +112,17 @@ class QuotaApp:
         self._background_photo = None
         self._background_warning = ""
         self._closed = False
+        self.quota_colors = QuotaColorAnimator(root, self._apply_quota_colors)
         self._drag_start = None
         self._drag_position = None
         self._last_click = None
+        self._details_open = False
+        self._menu_active = False
         self.follow_status = "独立悬浮"
         root.title("Codex 用量伴侣")
         root.overrideredirect(True)
+        if self.docked:
+            root.withdraw()
         root.configure(bg=THEMES[self.settings.theme]["bg"])
         self.canvas = tk.Canvas(root, width=self.WIDTH, height=self.height,
                                 highlightthickness=0, bd=0)
@@ -103,27 +133,211 @@ class QuotaApp:
         root.geometry(f"{self.WIDTH}x{self.height}+{x}+{y}")
         root.attributes("-alpha", self.settings.opacity)
         root.update_idletasks()
+        self.rounded_window = RoundedWindow(root, self.CORNER_RADIUS)
         self.follower = WindowFollower(root)
         if self.settings.follow_offset_x is not None and self.settings.follow_offset_y is not None:
             self.follower.set_offset(self.settings.follow_offset_x, self.settings.follow_offset_y)
         elif self.settings.follow_codex and self.settings.x is not None and self.settings.y is not None:
             self.follower.set_offset_from_position(x, y)
+        self.thumbnail = SidebarThumbnail(
+            root, self.settings, on_enter=self._sidebar_enter, on_leave=self._sidebar_leave,
+            on_click=self._sidebar_click, on_context=self._sidebar_context,
+        )
+        self.thumbnail_follower = WindowFollower(self.thumbnail.window)
+        if control is not None and not demo:
+            self.window_monitor = ClientWindowMonitor(self.follower._find_target)
+            self.follower._find_target = self.window_monitor.target
+            self.thumbnail_follower._find_target = self.window_monitor.target
+            self.tray = NotificationIcon(root, control.name, self.restore_window, self._tray_menu)
+            if self.runtime_log:
+                self.runtime_log.event("window_notifications_ready", hooks_active=self.window_monitor.hooks_active)
+                if not self.tray.available:
+                    self.runtime_log.event("tray_unavailable")
+        self.hover_controller = HoverController(
+            root, self._open_details, self._close_details, self._contains_hover,
+            hold_open=self._hold_details,
+        )
+        self.hover_controller.set_enabled(self.docked)
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<Motion>", self._hover)
         self.canvas.bind("<Button-3>", self._context_menu)
-        root.bind("<Escape>", lambda _: self.close())
-        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Escape>", lambda _: self.request_close())
+        root.protocol("WM_DELETE_WINDOW", self.request_close)
         self.draw()
         self.root.after(100, self._tick)
         self.root.after(200, self._follow_tick)
-        if not demo:
+        self.root.after(80, self._hover_tick)
+        if control is not None:
+            self.root.after(200, self._runtime_tick)
+        if not demo and not self.launch_linked:
             self.refresh()
 
     @property
     def height(self):
         return self.COMPACT_HEIGHT if self.settings.compact else self.HEIGHT
+
+    @property
+    def docked(self):
+        return self.settings.follow_codex and self.settings.sidebar_dock
+
+    def _contains_hover(self):
+        if self._user_hidden or self._temporary_independent or not self.docked or not self.thumbnail_follower.client_visible:
+            return False
+        pointer_x, pointer_y = self.root.winfo_pointerxy()
+        bounds = []
+        if self.thumbnail_follower.native_visible:
+            bounds.append(self.thumbnail.bounds())
+        if self._details_open and self.follower.native_visible:
+            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+            bounds.append((x, y, x + self.WIDTH, y + self.height))
+        return any(left <= pointer_x < right and top <= pointer_y < bottom
+                   for left, top, right, bottom in bounds)
+
+    def _hold_details(self):
+        if self._user_hidden or self._temporary_independent:
+            return False
+        if self._menu_active or self._drag_start is not None or time.monotonic() < self._restore_hold_until:
+            return True
+        if not self.docked or not self.thumbnail_follower.client_visible:
+            return False
+        return any(isinstance(child, tk.Toplevel) and child is not self.thumbnail.window
+                   and child.winfo_exists() and child.winfo_viewable()
+                   for child in self.root.winfo_children())
+
+    def _open_details(self):
+        if not self._closed and self.docked and not self._user_hidden and not self._temporary_independent:
+            self._details_open = True
+            self.follower.update(True, linked=True, anchor="sidebar-detail", visible=True)
+            self.draw()
+
+    def _close_details(self):
+        self._details_open = False
+        if not self._closed and self.docked and not self._user_hidden and not self._temporary_independent:
+            self.follower.update(True, linked=True, anchor="sidebar-detail", visible=False)
+
+    def _sidebar_enter(self):
+        self.hover_controller.enter()
+
+    def _sidebar_leave(self):
+        self.hover_controller.leave()
+
+    def _sidebar_click(self, event):
+        self.hover_controller.open_now()
+
+    def _sidebar_context(self, event):
+        self.hover_controller.open_now()
+        self._context_menu(event)
+
+    def _hover_tick(self):
+        if not self._closed:
+            self.hover_controller.poll()
+            self.root.after(80, self._hover_tick)
+
+    def _update_windows(self):
+        """Keep the thumbnail and detail window owned by the same Codex client."""
+        self.hover_controller.set_enabled(self.docked and not self._user_hidden and not self._temporary_independent)
+        if self._user_hidden:
+            self.follower.update(self.settings.follow_codex, linked=self.launch_linked,
+                                 anchor="sidebar-detail" if self.docked else "floating", visible=False)
+            self.thumbnail_follower.update(self.docked, linked=True, anchor="sidebar", visible=False)
+        elif self._temporary_independent:
+            self.thumbnail_follower.update(False, visible=False)
+            self.follow_status = self.follower.update(False, visible=True)
+        elif self.docked:
+            self.follow_status = self.follower.update(
+                True, linked=True, anchor="sidebar-detail", visible=self._details_open,
+            )
+            scale = self.follower.dpi_scale
+            self.thumbnail.draw(self.snapshot, busy=self.busy, error=bool(self.error),
+                                dpi_scale=scale, palette=THEMES[self.settings.theme])
+            self.thumbnail_follower.update(True, linked=True, anchor="sidebar")
+            if not self.follower.client_visible:
+                self.hover_controller.close()
+        else:
+            self.thumbnail_follower.update(False, visible=False)
+            self.follow_status = self.follower.update(self.settings.follow_codex,
+                                                      linked=self.launch_linked and self.settings.follow_codex)
+            self._remember_follow_offset(persist=True)
+
+    def _log_event(self, event, **fields):
+        if self.runtime_log:
+            self.runtime_log.event(event, **fields)
+
+    def _runtime_state(self):
+        if self._closed:
+            return "stopped"
+        if self._user_hidden:
+            return "hidden_by_user"
+        if self._temporary_independent or not self.settings.follow_codex:
+            return "independent"
+        if not self.follower.client_available:
+            return "waiting_for_codex"
+        if not self.follower.client_visible:
+            return "client_minimized"
+        return "sidebar" if self.docked else "following"
+
+    def request_close(self):
+        if self.launch_linked and self.control is not None:
+            self._user_hidden = True
+            self.hover_controller.close()
+            self._update_windows()
+            self._log_event("window_hidden", reason="close_button")
+        else:
+            self.close()
+
+    def restore_window(self):
+        if self._closed:
+            return
+        self._user_hidden = False
+        self._restore_hold_until = time.monotonic() + 3
+        target = self.window_monitor.target() if self.window_monitor else self.follower._find_target()
+        self._temporary_independent = bool(self.settings.follow_codex and not self._client_window_visible(target))
+        self._update_windows()
+        if self.docked and not self._temporary_independent:
+            self.hover_controller.open_now()
+        self._log_event("window_restored")
+
+    def _client_window_visible(self, target):
+        if not target:
+            return False
+        if not self.follower._supported:
+            return True
+        native = self.follower._user32
+        return bool(not native.IsIconic(target) and native.IsWindowVisible(target))
+
+    def _tray_menu(self):
+        self.restore_window()
+        x, y = self.root.winfo_pointerxy()
+        from types import SimpleNamespace
+        self._context_menu(SimpleNamespace(x_root=x, y_root=y))
+
+    def _runtime_tick(self):
+        if self._closed:
+            return
+        for action in self.control.pending():
+            if action == "stop":
+                self.close()
+                return
+            if action == "reload_startup":
+                try:
+                    self.launch_linked = bool(self.startup and self.startup.status().get("enabled"))
+                except OSError as error:
+                    if self.runtime_log:
+                        self.runtime_log.failure("startup_status_failed", error)
+            elif action == "restart_managed":
+                if self.managed:
+                    self.restore_window()
+                else:
+                    self._restart_task = True
+                    self.close()
+                    return
+            else:
+                self.restore_window()
+        if self.runtime_log:
+            self.runtime_log.state(self._runtime_state(), managed=self.managed)
+        self.root.after(200, self._runtime_tick)
 
     def _persist(self):
         try:
@@ -147,16 +361,31 @@ class QuotaApp:
         return self.canvas.create_text(x, y, text=text, fill=color or THEMES[self.settings.theme]["text"],
                                        font=(family, size, "bold" if bold else "normal"), anchor=anchor, **kw)
 
-    def _rounded(self, x1, y1, x2, y2, fill, radius=16, outline=""):
+    def _rounded(self, x1, y1, x2, y2, fill, radius=16, outline="", *, tags=()):
         # Smooth polygons remain native and render correctly at Windows DPI settings.
         points = [x1+radius,y1,x2-radius,y1,x2,y1,x2,y1+radius,x2,y2-radius,x2,y2,
                   x2-radius,y2,x1+radius,y2,x1,y2,x1,y2-radius,x1,y1+radius,x1,y1]
-        return self.canvas.create_polygon(points, smooth=True, splinesteps=24, fill=fill, outline=outline)
+        return self.canvas.create_polygon(points, smooth=True, splinesteps=24, fill=fill, outline=outline, tags=tags)
 
     def _button(self, bounds, label, callback, *, color=None, size=13):
         x1,y1,x2,y2 = bounds
         self._text((x1+x2)/2, (y1+y2)/2, label, size, color, anchor="center", family="Segoe UI Symbol")
         self.actions.append((bounds, callback))
+
+    def _draw_window_border(self, color):
+        c, r = self.canvas, self.CORNER_RADIUS
+        right, bottom = self.WIDTH - 1, self.height - 1
+        for bounds, start in [
+            ((0, 0, r*2, r*2), 90),
+            ((right-r*2, 0, right, r*2), 0),
+            ((right-r*2, bottom-r*2, right, bottom), 270),
+            ((0, bottom-r*2, r*2, bottom), 180),
+        ]:
+            c.create_arc(*bounds, start=start, extent=90, style="arc", outline=color)
+        c.create_line(r, 0, right-r, 0, fill=color)
+        c.create_line(right, r, right, bottom-r, fill=color)
+        c.create_line(r, bottom, right-r, bottom, fill=color)
+        c.create_line(0, r, 0, bottom-r, fill=color)
 
     def _make_background(self):
         theme = THEMES[self.settings.theme]
@@ -187,27 +416,41 @@ class QuotaApp:
             base = Image.blend(base, glow, .65)
         self._background_photo = ImageTk.PhotoImage(base, master=self.root)
 
+    def _apply_quota_colors(self, colors):
+        if not self._closed:
+            for period, color in colors.items():
+                self.canvas.itemconfigure("quota-color-" + period, fill=color)
+
     def draw(self):
         if self._closed:
             return
         c = self.canvas
         theme = THEMES[self.settings.theme]
+        colors = self.quota_colors.set_targets({
+            period: quota_color(window.remaining_percent if window else None, period, original, theme["muted"])
+            for period, window, original in (
+                ("five_hour", self.snapshot.five_hour if self.snapshot else None, theme["accent"]),
+                ("weekly", self.snapshot.weekly if self.snapshot else None, theme["second"]),
+            )
+        })
+        self.thumbnail.draw(self.snapshot, busy=self.busy, error=bool(self.error),
+                            dpi_scale=self.follower.dpi_scale, palette=theme)
         c.delete("all")
         c.configure(bg=theme["bg"], height=self.height)
         self.actions.clear()
         self._make_background()
         if self._background_photo:
             c.create_image(0, 0, image=self._background_photo, anchor="nw")
-        c.create_rectangle(0, 0, self.WIDTH-1, self.height-1, outline=theme["line"])
+        self._draw_window_border(theme["line"])
         self._rounded(22, 23, 58, 59, theme["card"], 11)
         self._text(40, 41, "⌘", 20, theme["accent"], anchor="center", family="Segoe UI Symbol")
         self._text(70, 22, "Codex", 16, bold=True, family="Segoe UI")
         self._text(71, 49, "用 量 伴 侣", 8, theme["muted"])
         self._button((292,22,324,58), "↻", self.refresh, color=theme["accent"], size=19)
         self._button((329,22,361,58), "⚙", self.open_settings, color=theme["muted"], size=15)
-        self._button((368,22,400,58), "×", self.close, color=theme["muted"], size=19)
+        self._button((368,22,400,58), "×", self.request_close, color=theme["muted"], size=19)
         if self.settings.compact:
-            self._draw_compact(theme)
+            self._draw_compact(theme, colors)
             return
         c.create_line(24, 79, 396, 79, fill=theme["line"])
         self._text(24, 93, "订阅剩余额度", 10, theme["muted"])
@@ -215,16 +458,18 @@ class QuotaApp:
         if self.demo:
             plan = "DEMO · 演示"
         self._text(394, 95, plan[:24], 9, theme["accent"], anchor="ne", family="Segoe UI")
-        self._draw_card(122, "5 小时", "短周期额度", self.snapshot.five_hour if self.snapshot else None, theme["accent"])
-        self._draw_card(264, "一周", "每周额度", self.snapshot.weekly if self.snapshot else None, theme["second"])
+        self._draw_card(122, "5 小时", "短周期额度", self.snapshot.five_hour if self.snapshot else None,
+                        colors["five_hour"], "quota-color-five_hour")
+        self._draw_card(264, "一周", "每周额度", self.snapshot.weekly if self.snapshot else None,
+                        colors["weekly"], "quota-color-weekly")
         self._draw_source(420, theme)
         c.create_line(24, 454, 396, 454, fill=theme["line"])
-        self._text(24, 475, self.follow_status if self.settings.follow_codex else "独立悬浮", 9, theme["muted"], anchor="w")
+        self._text(24, 475, "侧栏缩略 · 悬停展开" if self.docked else self.follow_status if self.settings.follow_codex else "独立悬浮", 9, theme["muted"], anchor="w")
         self.actions.append(((18,460,240,494), self.toggle_follow))
         self._text(394, 475, "外观设置  ›", 9, theme["accent"], anchor="e")
         self.actions.append(((292,460,402,494), self.open_settings))
 
-    def _draw_card(self, y, title, subtitle, window, accent):
+    def _draw_card(self, y, title, subtitle, window, color, color_tag):
         theme = THEMES[self.settings.theme]
         self._rounded(24, y, 396, y+128, theme["card"], 18, theme["line"])
         self._text(43, y+15, title, 11, bold=True)
@@ -243,28 +488,30 @@ class QuotaApp:
                 display = "<0.1"
             elif 99.9 < percent < 100:
                 display = ">99.9"
-            self._text(41, y+34, display, 35, accent if not expired else theme["muted"], bold=True, family="Segoe UI")
+            self._text(41, y+34, display, 35, color, bold=True, family="Segoe UI", tags=color_tag)
             suffix_x = 43 + len(display) * 24
-            self._text(suffix_x, y+56, "%", 16, theme["muted"], family="Segoe UI")
+            self._text(suffix_x, y+56, "%", 16, color, family="Segoe UI", tags=color_tag)
             self._text(375, y+67, "上次剩余" if expired else "剩余", 10, theme["muted"], anchor="ne")
             label = countdown(window.resets_at)
         self._rounded(43, y+92, 377, y+97, theme["line"], 2)
         if percent > 0:
             self._rounded(43, y+92, 43+max(3,334*percent/100), y+97,
-                          "#efb086" if percent <= 15 else accent, 2)
+                          color, 2, tags=color_tag)
         self._text(43, y+106, label, 8, theme["muted"])
 
-    def _draw_compact(self, theme):
-        for x, title, window, accent in [
-            (24,"5 小时",self.snapshot.five_hour if self.snapshot else None,theme["accent"]),
-            (224,"一周",self.snapshot.weekly if self.snapshot else None,theme["second"]),
+    def _draw_compact(self, theme, colors):
+        for x, title, window, period in [
+            (24,"5 小时",self.snapshot.five_hour if self.snapshot else None,"five_hour"),
+            (224,"一周",self.snapshot.weekly if self.snapshot else None,"weekly"),
         ]:
+            color, color_tag = colors[period], "quota-color-" + period
             self._text(x, 84, title, 10, theme["muted"])
             value = f"{window.remaining_percent:g}%" if window else "—"
-            self._text(x, 106, value, 27, accent, bold=True, family="Segoe UI")
+            self._text(x, 106, value, 27, color if window else theme["muted"], bold=True,
+                       family="Segoe UI", tags=color_tag if window else ())
             self._rounded(x, 155, x+172, 159, theme["line"], 2)
             if window and window.remaining_percent > 0:
-                self._rounded(x, 155, x+max(3,172*window.remaining_percent/100), 159, accent, 2)
+                self._rounded(x, 155, x+max(3,172*window.remaining_percent/100), 159, color, 2, tags=color_tag)
             self._text(x, 168, countdown(window.resets_at) if window else "未提供此周期", 8, theme["muted"])
         self._draw_source(209, theme)
         self.actions.append(((18,198,402,241), self.open_settings))
@@ -312,6 +559,8 @@ class QuotaApp:
             except Exception as exc:
                 # Provider messages contain no raw RPC responses or authentication data.
                 self.results.put((None, str(exc) if isinstance(exc, UsageError) else "读取额度失败，请检查 Codex 登录状态"))
+                if self.runtime_log:
+                    self.runtime_log.failure("usage_read_failed", exc)
         threading.Thread(target=worker, name="quota-read", daemon=True).start()
 
     def _tick(self):
@@ -325,17 +574,31 @@ class QuotaApp:
                 self.snapshot = snapshot
         except queue.Empty:
             pass
-        if not self.demo and not self.busy and time.monotonic() - self.last_attempt >= self.settings.refresh_seconds:
+        can_refresh = self._temporary_independent or not (self.launch_linked and self.settings.follow_codex) or self.follower.client_available
+        if not self.demo and can_refresh and not self.busy and time.monotonic() - self.last_attempt >= self.settings.refresh_seconds:
             self.refresh()
-        self.draw()
+        if can_refresh:
+            self.draw()
         self.root.after(1000, self._tick)
 
     def _follow_tick(self):
         if not self._closed:
             if self._drag_start is None:
                 try:
-                    self.follow_status = self.follower.update(self.settings.follow_codex)
-                    self._remember_follow_offset(persist=True)
+                    if self.window_monitor:
+                        target = self.window_monitor.target()
+                        available = bool(target)
+                        if self._temporary_independent and self._client_window_visible(target):
+                            self._temporary_independent = False
+                        if available and not self._client_present:
+                            self._temporary_independent = False
+                            if self.launch_linked:
+                                self._user_hidden = False
+                    self._update_windows()
+                    available = bool(self.window_monitor.target()) if self.window_monitor else self.follower.client_available
+                    if self.launch_linked and available and not self._client_present:
+                        self.refresh()
+                    self._client_present = available
                 except (OSError, tk.TclError):
                     self.follow_status = "暂时无法跟随窗口"
             self.root.after(800, self._follow_tick)
@@ -352,14 +615,16 @@ class QuotaApp:
         else:
             self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
             self.follower.detach()
+            self.settings.sidebar_dock = False
         self.settings.follow_codex = enabled
-        self.follow_status = self.follower.update(enabled)
+        self.hover_controller.set_enabled(self.docked)
+        self._update_windows()
         self._remember_follow_offset()
         self._persist()
         self.draw()
 
     def _remember_follow_offset(self, *, persist=False):
-        if not self.settings.follow_codex:
+        if not self.settings.follow_codex or self.docked:
             return
         offset = self.follower.offset
         saved = (self.settings.follow_offset_x, self.settings.follow_offset_y)
@@ -373,7 +638,7 @@ class QuotaApp:
         self._last_click = (event.x_root, event.y_root)
         self._drag_start = None
         self._drag_position = None
-        if event.y < 77 and not any(x1 <= event.x <= x2 and y1 <= event.y <= y2 for (x1,y1,x2,y2),_ in self.actions):
+        if not self.docked and event.y < 77 and not any(x1 <= event.x <= x2 and y1 <= event.y <= y2 for (x1,y1,x2,y2),_ in self.actions):
             self._drag_start = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
 
     def _drag(self, event):
@@ -403,22 +668,58 @@ class QuotaApp:
 
     def _hover(self, event):
         clickable = any(x1 <= event.x <= x2 and y1 <= event.y <= y2 for (x1,y1,x2,y2),_ in self.actions)
-        self.canvas.configure(cursor="hand2" if clickable else "fleur" if event.y < 77 else "")
+        self.canvas.configure(cursor="hand2" if clickable else "fleur" if event.y < 77 and not self.docked else "")
 
     def _context_menu(self, event):
         menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="恢复用量窗口", command=self.restore_window)
+        menu.add_command(label="隐藏到后台" if self.launch_linked else "关闭窗口", command=self.request_close)
+        menu.add_separator()
         menu.add_command(label="刷新额度", command=self.refresh)
         menu.add_command(label="外观与设置", command=self.open_settings)
         menu.add_command(label="数据与连接", command=self.open_connection)
+        menu.add_command(label="切换侧栏缩略显示", command=lambda: self.set_sidebar_dock(not self.docked))
         menu.add_command(label="切换精简模式", command=self.toggle_compact)
         menu.add_command(label="切换窗口跟随", command=self.toggle_follow)
         menu.add_separator()
-        menu.add_command(label="退出", command=self.close)
-        menu.tk_popup(event.x_root, event.y_root)
+        menu.add_command(label="退出程序（下次 Windows 登录恢复）" if self.launch_linked else "退出", command=self.close)
+        self._menu_active = True
+
+        def unposted(event):
+            if event.widget is menu:
+                self._menu_active = False
+                if not self._closed:
+                    self.root.after_idle(menu.destroy)
+
+        menu.bind("<Unmap>", unposted)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        except tk.TclError:
+            self._menu_active = False
+        finally:
+            try:
+                menu.grab_release()
+                # Windows' native popup blocks until dismissed and does not emit
+                # a Tk Unmap event. Other Tk backends can return while posted.
+                if not menu.winfo_ismapped():
+                    self._menu_active = False
+                    menu.destroy()
+            except tk.TclError:
+                self._menu_active = False
+
+    def set_sidebar_dock(self, enabled):
+        self.settings.sidebar_dock = enabled
+        if enabled:
+            self.settings.follow_codex = True
+        self.hover_controller.set_enabled(self.docked)
+        self._update_windows()
+        self._persist()
+        self.draw()
 
     def toggle_compact(self):
         self.settings.compact = not self.settings.compact
         self.root.geometry(f"{self.WIDTH}x{self.height}")
+        self._update_windows()
         self._persist()
         self.draw()
 
@@ -432,8 +733,8 @@ class QuotaApp:
         win.resizable(False, False)
         win.transient(self.root)
         win.configure(bg="#141c28")
-        sx, sy = self._clamp_position(self.root.winfo_x()-480, self.root.winfo_y(), width=470, height=644)
-        win.geometry(f"470x644+{sx}+{sy}")
+        sx, sy = self._clamp_position(self.root.winfo_x()-480, self.root.winfo_y(), width=470, height=716)
+        win.geometry(f"470x716+{sx}+{sy}")
         style = ttk.Style(win)
         style.theme_use("clam")
         style.configure("Quota.TFrame", background="#141c28")
@@ -492,8 +793,40 @@ class QuotaApp:
         flags.pack(fill="x", pady=(20,8))
         follow_var = tk.BooleanVar(value=self.settings.follow_codex)
         compact_var = tk.BooleanVar(value=self.settings.compact)
+        sidebar_var = tk.BooleanVar(value=self.docked)
+
+        def change_sidebar():
+            self.set_sidebar_dock(sidebar_var.get())
+            follow_var.set(self.settings.follow_codex)
+
+        ttk.Checkbutton(flags, text="侧栏缩略显示（悬停展开）", variable=sidebar_var,
+                        style="Quota.TCheckbutton", command=change_sidebar).pack(anchor="w", pady=3)
         ttk.Checkbutton(flags, text="跟随 Codex 窗口", variable=follow_var, style="Quota.TCheckbutton", command=lambda: change("follow_codex",follow_var.get())).pack(anchor="w", pady=3)
         ttk.Checkbutton(flags, text="精简面板", variable=compact_var, style="Quota.TCheckbutton", command=lambda: change("compact",compact_var.get())).pack(anchor="w", pady=3)
+        startup_var = tk.BooleanVar(value=self.launch_linked)
+
+        def change_startup():
+            try:
+                if startup_var.get():
+                    self.startup.enable()
+                else:
+                    self.startup.disable()
+                self.launch_linked = self.startup.is_enabled()
+                self._log_event("startup_configuration_changed")
+                if self.launch_linked and self.control is not None and not self.managed:
+                    # Release this manually launched instance before the scheduler
+                    # starts the independent background instance.
+                    self._restart_task = True
+                    self.root.after_idle(self.close)
+            except OSError as exc:
+                startup_var.set(self.launch_linked)
+                messagebox.showerror("启动联动设置失败", str(exc), parent=win)
+
+        startup_check = ttk.Checkbutton(flags, text="Windows 登录后自动运行（当前用户）", variable=startup_var,
+                                        style="Quota.TCheckbutton", command=change_startup)
+        startup_check.pack(anchor="w", pady=3)
+        if self.startup is None:
+            startup_check.state(["disabled"])
         interval_row = ttk.Frame(frame, style="Quota.TFrame")
         interval_row.pack(fill="x", pady=(8,12))
         ttk.Label(interval_row, text="自动刷新", style="Quota.TLabel").pack(side="left")
@@ -502,18 +835,20 @@ class QuotaApp:
         picker.pack(side="left", padx=(16,8))
         ttk.Label(interval_row, text="秒", style="Quota.TLabel").pack(side="left")
         picker.bind("<<ComboboxSelected>>", lambda _: change("refresh_seconds",int(interval_var.get())))
-        ttk.Label(frame, text="拖动顶部调整位置，跟随状态保持不变。\n点击模式开关可切换为独立悬浮。", style="Hint.Quota.TLabel").pack(anchor="w", pady=(2,10))
+        ttk.Label(frame, text="侧栏模式：悬停展开，移开自动收起。\n普通浮窗模式可拖动顶部调整位置。", style="Hint.Quota.TLabel").pack(anchor="w", pady=(2,10))
         ttk.Button(frame, text="完成", style="Quota.TButton", command=lambda: close_settings()).pack(anchor="e")
 
         def change(key, value, persist=True):
             if key == "follow_codex":
                 self.set_follow(bool(value))
+                sidebar_var.set(self.docked)
                 return
             setattr(self.settings, key, value)
             if key == "opacity":
                 self.root.attributes("-alpha", value)
             elif key == "compact":
                 self.root.geometry(f"{self.WIDTH}x{self.height}")
+                self._update_windows()
             if persist:
                 self._persist()
             self.draw()
@@ -589,6 +924,15 @@ class QuotaApp:
         if self._closed:
             return
         self._closed = True
+        self.quota_colors.dispose()
+        if self.tray:
+            self.tray.close()
+        if self.window_monitor:
+            self.window_monitor.close()
+        if self.runtime_log:
+            self.runtime_log.state("stopped", managed=self.managed)
+        self.hover_controller.dispose()
+        self.thumbnail.destroy()
         if not self.settings.follow_codex:
             self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
         self._persist()

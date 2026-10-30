@@ -10,6 +10,60 @@ import sys
 from typing import Any
 
 
+SIDEBAR_WIDTH_DP = 52
+SIDEBAR_THUMBNAIL_DP = (40, 156)
+SIDEBAR_BOTTOM_GAP_DP = 90
+SIDEBAR_DETAIL_GAP_DP = 8
+
+
+def _clamp_to_desktop(
+    x: int, y: int, size: tuple[int, int], desktop: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    left, top, width, height = desktop
+    return (
+        max(left, min(x, left + max(0, width - size[0]))),
+        max(top, min(y, top + max(0, height - size[1]))),
+    )
+
+
+def sidebar_geometry(
+    client_rect: tuple[int, int, int, int],
+    widget_size: tuple[int, int],
+    scale: float = 1.0,
+    anchor: str = "sidebar",
+    desktop_rect: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int]:
+    """Position a thumbnail or its detail panel in physical screen pixels.
+
+    ``client_rect`` contains left/top/right/bottom screen coordinates. As with
+    ``desktop_bounds``, ``desktop_rect`` contains x/y/width/height and supports
+    monitors to the left of or above the primary monitor. A short client keeps
+    its thumbnail at the top; the detail panel remains aligned to that thumbnail
+    until the desktop boundary requires clipping its position.
+    """
+    if anchor not in ("sidebar", "sidebar-detail"):
+        raise ValueError(f"Unknown sidebar anchor: {anchor}")
+    if not 0 < scale < float("inf"):
+        scale = 1.0
+    left, top, right, bottom = client_rect
+    width, height = widget_size
+    rail_width = round(SIDEBAR_WIDTH_DP * scale)
+    thumbnail_width = round(SIDEBAR_THUMBNAIL_DP[0] * scale)
+    thumbnail_height = round(SIDEBAR_THUMBNAIL_DP[1] * scale)
+    bottom_gap = round(SIDEBAR_BOTTOM_GAP_DP * scale)
+    if anchor == "sidebar":
+        x = left + round((rail_width - width) / 2)
+        y = max(top, bottom - bottom_gap - height)
+    else:
+        thumbnail_x = left + round((rail_width - thumbnail_width) / 2)
+        thumbnail_y = max(top, bottom - bottom_gap - thumbnail_height)
+        x = thumbnail_x + thumbnail_width + round(SIDEBAR_DETAIL_GAP_DP * scale)
+        y = thumbnail_y + thumbnail_height - height
+    if desktop_rect is not None:
+        x, y = _clamp_to_desktop(x, y, widget_size, desktop_rect)
+    return x, y
+
+
 def desktop_bounds(root: Any) -> tuple[int, int, int, int]:
     """Return virtual desktop bounds, including monitors left/above primary."""
     if sys.platform == "win32":
@@ -40,6 +94,9 @@ class WindowFollower:
         self._offset = self.DEFAULT_OFFSET
         self._pending_position: tuple[int, int] | None = None
         self._last_rect: tuple[int, int, int, int] | None = None
+        self.client_available = False
+        self.client_visible = False
+        self.dpi_scale = 1.0
         if self._supported:
             self._bind_win32()
 
@@ -63,6 +120,8 @@ class WindowFollower:
             "IsIconic": ([wintypes.HWND], wintypes.BOOL),
             "GetWindowThreadProcessId": ([wintypes.HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD),
             "GetWindowRect": ([wintypes.HWND, ctypes.POINTER(wintypes.RECT)], wintypes.BOOL),
+            "GetClientRect": ([wintypes.HWND, ctypes.POINTER(wintypes.RECT)], wintypes.BOOL),
+            "ClientToScreen": ([wintypes.HWND, ctypes.POINTER(wintypes.POINT)], wintypes.BOOL),
             "SetWindowPos": ([wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                               ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.BOOL),
             "ShowWindow": ([wintypes.HWND, ctypes.c_int], wintypes.BOOL),
@@ -71,6 +130,10 @@ class WindowFollower:
         for name, (arguments, result) in signatures.items():
             function = getattr(user32, name)
             function.argtypes, function.restype = arguments, result
+        self._get_dpi = getattr(user32, "GetDpiForWindow", None)
+        if self._get_dpi is not None:
+            self._get_dpi.argtypes = [wintypes.HWND]
+            self._get_dpi.restype = wintypes.UINT
         # LONG_PTR is pointer-sized on 64-bit Windows, unlike ctypes.c_long.
         get_name = "GetWindowLongPtrW" if ctypes.sizeof(ctypes.c_void_p) == 8 else "GetWindowLongW"
         set_name = "SetWindowLongPtrW" if ctypes.sizeof(ctypes.c_void_p) == 8 else "SetWindowLongW"
@@ -137,10 +200,8 @@ class WindowFollower:
                 # This excludes the CLI console and browser tabs by process path.
                 if not class_name.value.startswith("Chrome_WidgetWin"):
                     return True
-                title = self._ctypes.create_unicode_buffer(1024)
-                self._user32.GetWindowTextW(hwnd, title, len(title))
-                if not any(name in title.value.casefold() for name in ("codex", "chatgpt")):
-                    return True
+                # The title can change during sign-in or when switching chats.
+                # Match the application binary and native class instead.
                 path = self._process_path(hwnd)
                 if path not in process_cache:
                     process_cache[path] = self._is_codex_process(path)
@@ -175,8 +236,66 @@ class WindowFollower:
 
     def _show(self) -> None:
         if self._hidden or not self._user32.IsWindowVisible(self._own_hwnd()):
+            if self.root.state() == "withdrawn":
+                mode, owner = self._mode, self._owner
+                self.root.deiconify()
+                self.root.update_idletasks()
+                # Tk can replace its native wrapper when mapping a withdrawn root.
+                self._hwnd = 0
+                self._mode = None
+                self._configure(bool(mode), owner)
             self._user32.ShowWindow(self._own_hwnd(), 4)  # SW_SHOWNOACTIVATE.
             self._hidden = False
+
+    def _hide(self) -> None:
+        if not self._hidden:
+            self._user32.ShowWindow(self._own_hwnd(), 0)
+            self._hidden = True
+
+    @property
+    def native_visible(self) -> bool:
+        """Whether the widget is currently visible according to the window system."""
+        if self._supported:
+            try:
+                return bool(self._user32.IsWindowVisible(self._own_hwnd()))
+            except (OSError, RuntimeError):
+                return False
+        try:
+            return bool(self.root.winfo_viewable())
+        except (AttributeError, RuntimeError):
+            return False
+
+    def _dpi_for_target(self, target: int) -> float:
+        get_dpi = getattr(self, "_get_dpi", None)
+        if get_dpi is not None:
+            try:
+                dpi = get_dpi(target)
+                if dpi:
+                    return dpi / 96.0
+            except OSError:
+                pass
+        return 1.0
+
+    def _client_rect(self, target: int) -> tuple[int, int, int, int] | None:
+        rect = self._wintypes.RECT()
+        if not self._user32.GetClientRect(target, self._ctypes.byref(rect)):
+            return None
+        origin = self._wintypes.POINT(rect.left, rect.top)
+        if not self._user32.ClientToScreen(target, self._ctypes.byref(origin)):
+            return None
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return (origin.x, origin.y, origin.x + rect.right - rect.left,
+                origin.y + rect.bottom - rect.top)
+
+    def _desktop_rect(self) -> tuple[int, int, int, int]:
+        return tuple(self._user32.GetSystemMetrics(index) for index in (76, 77, 78, 79))
+
+    def _set_visibility(self, visible: bool) -> None:
+        if visible:
+            self._show()
+        else:
+            self._hide()
 
     def set_offset(self, dx: int, dy: int) -> None:
         self._offset = (int(dx), int(dy))
@@ -197,57 +316,75 @@ class WindowFollower:
     def set_offset_from_position(self, x: int, y: int) -> None:
         """Preserve a drag position without waiting for Tk's geometry update."""
         if self._last_rect is not None:
-            width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
+            width = max(1, self.root.winfo_width())
             self.set_offset(int(x) - (self._last_rect[2] - width), int(y) - self._last_rect[1])
         else:
             # A drag before Codex opens must also survive the first follow tick.
             self._pending_position = (int(x), int(y))
 
-    def update(self, enabled: bool) -> str:
+    def update(
+        self, enabled: bool, *, linked: bool = False,
+        anchor: str = "floating", visible: bool = True,
+    ) -> str:
+        if anchor not in ("floating", "sidebar", "sidebar-detail"):
+            raise ValueError(f"Unknown window anchor: {anchor}")
         if not self._supported:
             try:
                 self.root.attributes("-topmost", not enabled)
+                if not visible:
+                    self.root.withdraw()
             except Exception:
                 pass
             return "当前系统不支持窗口跟随" if enabled else "独立悬浮窗"
         try:
             self._own_hwnd()
-            if not enabled:
-                self._target = 0
+            target = self._find_target() if enabled or linked else 0
+            self.client_available = bool(target)
+            minimized = bool(target and self._user32.IsIconic(target))
+            self.client_visible = bool(target and not minimized and self._user32.IsWindowVisible(target))
+            self.dpi_scale = self._dpi_for_target(target) if target else 1.0
+            self._target = target if enabled else 0
+            # Even a hidden popup must have the correct native owner relationship.
+            self._configure(enabled, target if enabled else 0)
+            if linked and not target:
                 self._last_rect = None
-                self._configure(False, 0)
-                self._show()
+                self._hide()
+                return "等待 Codex 启动"
+            if target and (enabled or linked) and not self.client_visible:
+                self._hide()
+                return "Codex 已最小化" if minimized else "Codex 窗口已隐藏"
+            if not enabled:
+                self._last_rect = None
+                self._set_visibility(visible)
                 return "独立悬浮窗"
-            target = self._find_target()
-            self._target = target
-            self._configure(True, target)
             if not target:
                 self._last_rect = None
-                self._show()
+                self._set_visibility(visible)
                 return "等待 Codex 桌面客户端"
-            if self._user32.IsIconic(target):
-                self._user32.ShowWindow(self._hwnd, 0)
-                self._hidden = True
-                return "Codex 已最小化"
             rect = self._wintypes.RECT()
             if not self._user32.GetWindowRect(target, self._ctypes.byref(rect)):
-                self._show()
+                self._set_visibility(visible and not linked and anchor == "floating")
                 return "等待 Codex 桌面客户端"
             self._last_rect = (rect.left, rect.top, rect.right, rect.bottom)
             self.root.update_idletasks()
-            if self._pending_position is not None:
-                self.set_offset_from_position(*self._pending_position)
-            width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
-            height = max(self.root.winfo_height(), self.root.winfo_reqheight())
-            x = rect.right - width + self._offset[0]
-            y = rect.top + self._offset[1]
-            # Keep the widget reachable when the owner is partly off-screen.
-            screen_x, screen_y = self._user32.GetSystemMetrics(76), self._user32.GetSystemMetrics(77)
-            screen_w, screen_h = self._user32.GetSystemMetrics(78), self._user32.GetSystemMetrics(79)
-            x = max(screen_x, min(x, screen_x + max(0, screen_w - width)))
-            y = max(screen_y, min(y, screen_y + max(0, screen_h - height)))
-            self._user32.SetWindowPos(self._hwnd, 0, x, y, 0, 0, 0x15)
-            self._show()
+            # Requested geometry can belong to a much larger detail panel. The
+            # current native size is authoritative for a collapsed thumbnail.
+            size = (max(1, self.root.winfo_width()), max(1, self.root.winfo_height()))
+            if anchor in ("sidebar", "sidebar-detail"):
+                client_rect = self._client_rect(target)
+                if client_rect is None:
+                    self.client_visible = False
+                    self._hide()
+                    return "等待 Codex 客户区"
+                x, y = sidebar_geometry(client_rect, size, self.dpi_scale, anchor, self._desktop_rect())
+            else:
+                if self._pending_position is not None:
+                    self.set_offset_from_position(*self._pending_position)
+                x = rect.right - size[0] + self._offset[0]
+                y = rect.top + self._offset[1]
+                x, y = _clamp_to_desktop(x, y, size, self._desktop_rect())
+            self._set_visibility(visible)
+            self._user32.SetWindowPos(self._own_hwnd(), 0, x, y, 0, 0, 0x15)
             return "已跟随 Codex"
         except (OSError, RuntimeError):
             return "窗口跟随暂不可用"

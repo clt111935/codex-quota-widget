@@ -28,6 +28,7 @@ class Settings:
     codex_command: str = ""
     follow_offset_x: int | None = None
     follow_offset_y: int | None = None
+    sidebar_dock: bool = True
 
 
 def _number(value: Any, default: float, low: float, high: float) -> float:
@@ -98,6 +99,7 @@ def _validated(raw: Any) -> Settings:
         codex_command=command,
         follow_offset_x=_coordinate(raw.get("follow_offset_x")),
         follow_offset_y=_coordinate(raw.get("follow_offset_y")),
+        sidebar_dock=_boolean(raw.get("sidebar_dock"), defaults.sidebar_dock),
     )
 
 
